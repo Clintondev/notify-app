@@ -1,31 +1,5 @@
 {
   "version": 2,
-  "rules": [
-    {
-      "name": "aikodigital",
-      "url_contains": "github.com",
-      "type": "element",
-      "selector": "#switch_dashboard_context_show-button > button.Button--invisible.Button--medium.Button > span.Button-content:nth-of-type(1) > span.Button-label > span:nth-of-type(2)",
-      "condition": "text_differs",
-      "baseline_text": "aikodigital",
-      "text_snapshot": "aikodigital",
-      "css_selector": "#switch_dashboard_context_show-button > button.Button--invisible.Button--medium.Button > span.Button-content:nth-of-type(1) > span.Button-label > span:nth-of-type(2)",
-      "page_url": "https://github.com/orgs/aikodigital/dashboard",
-      "source": "extension",
-      "captured_at": 1759881868.964
-    },
-    {
-      "name": "Ctrl-Enter-Development",
-      "url_contains": "github.com",
-      "type": "element",
-      "selector": "body.logged-in.env-production.page-responsive > div.logged-in.env-production.page-responsive:nth-of-type(1) > div.application-main:nth-of-type(6) > div.color-bg-default > div.d-md-flex.feed-background > aside.feed-left-sidebar.col-md-4.col-lg-3 > div.dashboard-sidebar.px-3.px-md-4 > div.border-bottom.py-3.mt-3:nth-of-type(1)",
-      "condition": "text_differs",
-      "baseline_text": "Ctrl-Enter-Development",
-      "text_snapshot": "Ctrl-Enter-Development",
-      "css_selector": "body.logged-in.env-production.page-responsive > div.logged-in.env-production.page-responsive:nth-of-type(1) > div.application-main:nth-of-type(6) > div.color-bg-default > div.d-md-flex.feed-background > aside.feed-left-sidebar.col-md-4.col-lg-3 > div.dashboard-sidebar.px-3.px-md-4 > div.border-bottom.py-3.mt-3:nth-of-type(1)",
-      "page_url": "https://github.com/orgs/Ctrl-Enter-Development/dashboard",
-      "source": "extension",
-      "captured_at": 1759881910.441
-    }
-  ]
+  "ntfy_topic": "gemini-notify-r2d2-ax7b9",
+  "rules": []
 }

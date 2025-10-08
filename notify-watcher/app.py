@@ -3,6 +3,7 @@ import sys
 import json
 import threading
 import time
+import base64
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -20,7 +21,15 @@ PENDING_RULE_FILE = "notify-watcher/pending_rule.json"
 RULES_SCHEMA_VERSION = 2
 
 # --- Configuração ---
-NTFY_TOPIC = ""
+def _load_config():
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+_config = _load_config()
+NTFY_TOPIC = _config.get("ntfy_topic", "gemini-notify-r2d2-ax7b9")
 NOTIFICATION_METHOD = "ntfy"
 IGNORED_APPS = set()
 
@@ -201,13 +210,13 @@ def sanitize_rule_payload(payload, *, default_source="extension"):
 load_ignored_apps_from_disk()
 
 # --- Lógica de Envio ---
-def send_notification(message):
+def send_notification(message, screenshot=None, screenshot_title=None, screenshot_mime='image/png'):
     if NOTIFICATION_METHOD == "ntfy":
-        send_to_ntfy(message)
+        send_to_ntfy(message, screenshot=screenshot, screenshot_title=screenshot_title, screenshot_mime=screenshot_mime)
     else:
         print(f"❗️ Método de notificação desconhecido: {NOTIFICATION_METHOD}")
 
-def send_to_ntfy(message):
+def send_to_ntfy(message, screenshot=None, screenshot_title=None, screenshot_mime='image/png'):
     if not NTFY_TOPIC:
         print("⚠️ NTFY_TOPIC não configurado")
         return
@@ -217,6 +226,20 @@ def send_to_ntfy(message):
             data=message.encode('utf-8')
         )
         print(f"✅ Notificação enviada via ntfy.sh: {message[:30]}...")
+        if screenshot:
+            extension = 'png'
+            if screenshot_mime.endswith('/jpeg') or screenshot_mime.endswith('/jpg'):
+                extension = 'jpg'
+            filename = f"screenshot-{int(time.time() * 1000)}.{extension}"
+            headers = {}
+            if screenshot_title:
+                headers['Title'] = screenshot_title[:120]
+            requests.post(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                files={'file': (filename, screenshot, screenshot_mime)},
+                headers=headers
+            )
+            print("✅ Screenshot enviada via ntfy.sh")
     except Exception as e:
         print(f"❌ Erro ao enviar para ntfy.sh: {e}")
 
@@ -229,12 +252,30 @@ def notify():
     data = request.json
     app_name = data.get('app', 'Browser')
     text = data.get('text', 'Nenhuma mensagem.')
+    screenshot_b64 = data.get('screenshot')
+    screenshot_bytes = None
+    screenshot_mime = 'image/png'
+    if screenshot_b64:
+        try:
+            if screenshot_b64.startswith('data:image'):
+                header, screenshot_b64 = screenshot_b64.split(',', 1)
+                try:
+                    screenshot_mime = header.split(';')[0].split(':', 1)[1] or screenshot_mime
+                except (IndexError, ValueError):
+                    screenshot_mime = 'image/png'
+            screenshot_bytes = base64.b64decode(screenshot_b64)
+        except Exception as exc:
+            screenshot_bytes = None
+            print(f"⚠️ Falha ao decodificar screenshot: {exc}")
     if should_ignore(app_name):
         print(f"⏭️ Ignorando notificação HTTP de {app_name}.")
         return jsonify({'status': 'ignored'}), 200
     full_message = f"[{app_name}] {text}"
     print(f"📡 Recebido via HTTP: {full_message}")
-    send_notification(full_message)
+    screenshot_title = data.get('rule', {}).get('name') if isinstance(data.get('rule'), dict) else None
+    if screenshot_title:
+        screenshot_title = f"{screenshot_title} – captura"
+    send_notification(full_message, screenshot=screenshot_bytes, screenshot_title=screenshot_title, screenshot_mime=screenshot_mime)
     return jsonify({'status': 'ok'}), 200
 
 
@@ -450,6 +491,7 @@ class RuleDialog(QDialog):
         self.page_url = ""
         self.source = "manual"
         self.captured_at = None
+        self.metadata = {}
 
         self.condition_input.currentTextChanged.connect(self._update_condition_fields)
         self.type_input.currentTextChanged.connect(self._on_type_changed)
@@ -471,6 +513,9 @@ class RuleDialog(QDialog):
             self.page_url = rule.get("page_url", "")
             self.source = rule.get("source", "extension")
             self.captured_at = rule.get("captured_at")
+            metadata = rule.get("metadata")
+            if isinstance(metadata, dict):
+                self.metadata = dict(metadata)
         self._update_condition_fields()
 
     def _on_type_changed(self, new_type):
@@ -517,6 +562,8 @@ class RuleDialog(QDialog):
             result["source"] = self.source
         if self.captured_at is not None:
             result["captured_at"] = self.captured_at
+        if self.metadata:
+            result["metadata"] = self.metadata
         if length_threshold is None:
             result.pop("length_threshold", None)
         return result

@@ -25,6 +25,44 @@ let lastTitle = document.title || '';
 const recentKeys = [];
 const recentKeySet = new Set();
 const selectorErrorCache = new Set();
+const ATTRIBUTE_NAMES_OF_INTEREST = new Set([
+  'id',
+  'class',
+  'name',
+  'role',
+  'type',
+  'value',
+  'title',
+  'placeholder',
+  'disabled',
+  'hidden',
+  'aria-label',
+  'aria-live',
+  'aria-expanded',
+  'aria-selected',
+  'aria-pressed',
+  'aria-current',
+  'aria-disabled',
+  'data-state',
+  'data-status',
+  'data-testid',
+  'data-test',
+  'data-qa',
+  'data-automation-id'
+]);
+const SUMMARY_ATTRIBUTE_PRIORITY = [
+  'data-state',
+  'data-status',
+  'aria-label',
+  'aria-live',
+  'aria-pressed',
+  'aria-expanded',
+  'aria-selected',
+  'value',
+  'class'
+];
+const DATA_ATTRIBUTE_CAPTURE_LIMIT = 6;
+let ruleElementState = new Map();
 
 const selectionState = {
   active: false,
@@ -57,12 +95,200 @@ function normalizeText(text) {
   return text.replace(/\s+/g, ' ').trim().slice(0, 200);
 }
 
-function notifyServer(payload) {
-  fetch(`${API_BASE}/notify`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  }).catch(err => console.error('[notify-watcher] Erro ao enviar para o servidor local:', err));
+function truncate(value, max = 160) {
+  if (value == null) {
+    return '';
+  }
+  const str = String(value);
+  if (str.length <= max) {
+    return str;
+  }
+  return `${str.slice(0, max - 3)}...`;
+}
+
+function shortHash(input) {
+  if (!input) {
+    return '';
+  }
+  let hash = 0;
+  for (let index = 0; index < input.length; index += 1) {
+    hash = (hash << 5) - hash + input.charCodeAt(index);
+    hash |= 0;
+  }
+  return hash.toString(16);
+}
+
+function getRelevantAttributeEntries(element) {
+  if (!element || typeof element.getAttributeNames !== 'function') {
+    return [];
+  }
+  const entries = [];
+  let capturedDataAttributes = 0;
+  for (const name of element.getAttributeNames()) {
+    if (!name) {
+      continue;
+    }
+    const lowerName = name.toLowerCase();
+    const isData = lowerName.startsWith('data-');
+    const isAria = lowerName.startsWith('aria-');
+    if (
+      !ATTRIBUTE_NAMES_OF_INTEREST.has(lowerName) &&
+      !isData &&
+      !isAria
+    ) {
+      continue;
+    }
+    if (isData) {
+      capturedDataAttributes += 1;
+      if (capturedDataAttributes > DATA_ATTRIBUTE_CAPTURE_LIMIT) {
+        continue;
+      }
+    }
+    const value = element.getAttribute(name);
+    if (value == null || value === '') {
+      continue;
+    }
+    entries.push([lowerName, truncate(value)]);
+  }
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
+  return entries;
+}
+
+function buildRuleState(rule, element, elementText) {
+  const summaryParts = [];
+  const attributes = {};
+  const attributeEntries = getRelevantAttributeEntries(element);
+  for (const [attrName, attrValue] of attributeEntries) {
+    attributes[attrName] = attrValue;
+  }
+
+  const tagName = element?.tagName ? element.tagName.toLowerCase() : '';
+  if (!attributes.class && element?.className) {
+    attributes.class = truncate(element.className);
+  }
+
+  let inputValue = null;
+  let checked = null;
+  if (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement
+  ) {
+    inputValue = truncate(element.value);
+  }
+  if (
+    element instanceof HTMLInputElement &&
+    (element.type === 'checkbox' || element.type === 'radio')
+  ) {
+    checked = Boolean(element.checked);
+  }
+
+  if (elementText) {
+    summaryParts.push(`texto="${elementText}"`);
+  }
+  if (inputValue && (!elementText || inputValue !== elementText)) {
+    summaryParts.push(`valor="${inputValue}"`);
+  }
+
+  for (const attrName of SUMMARY_ATTRIBUTE_PRIORITY) {
+    if (summaryParts.length >= 3) {
+      break;
+    }
+    if (attrName === 'value') {
+      continue;
+    }
+    if (attrName === 'class' && attributes.class) {
+      const classSummary = attributes.class
+        .split(/\s+/)
+        .filter(Boolean)
+        .slice(0, 3)
+        .join(' ');
+      if (classSummary) {
+        summaryParts.push(`classes="${classSummary}"`);
+      }
+      continue;
+    }
+    const attrValue = attributes[attrName];
+    if (attrValue) {
+      summaryParts.push(`${attrName}="${attrValue}"`);
+    }
+  }
+
+  if (!summaryParts.length && attributes.class) {
+    const classSummary = attributes.class
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 3)
+      .join(' ');
+    if (classSummary) {
+      summaryParts.push(`classes="${classSummary}"`);
+    }
+  }
+
+  const state = {
+    tag: tagName,
+    text: elementText || '',
+    value: inputValue,
+    checked,
+    attributes
+  };
+
+  let signature = null;
+  try {
+    signature = JSON.stringify(state);
+  } catch (error) {
+    signature = null;
+  }
+
+  return {
+    signature,
+    summaryParts,
+    state
+  };
+}
+
+function shouldEvaluate(rule, element, signature) {
+  if (!signature) {
+    return true;
+  }
+  let elementState = ruleElementState.get(rule.id);
+  if (!elementState) {
+    elementState = new WeakMap();
+    ruleElementState.set(rule.id, elementState);
+  }
+  const previousSignature = elementState.get(element);
+  if (previousSignature === signature) {
+    return false;
+  }
+  elementState.set(element, signature);
+  return true;
+}
+
+function refreshRuleStateCache(rules) {
+  const nextState = new Map();
+  for (const rule of rules) {
+    if (ruleElementState.has(rule.id)) {
+      nextState.set(rule.id, ruleElementState.get(rule.id));
+    } else {
+      nextState.set(rule.id, new WeakMap());
+    }
+  }
+  ruleElementState = nextState;
+}
+
+async function notifyServer(payload) {
+  try {
+    const response = await fetch(`${API_BASE}/notify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      throw new Error(`Status ${response.status}`);
+    }
+  } catch (error) {
+    console.error('[notify-watcher] Erro ao enviar para o servidor local:', error);
+  }
 }
 
 function sendTitleChangeNotification(newTitle) {
@@ -109,7 +335,42 @@ function triggerNotification(rule, details) {
     return;
   }
   console.log(`[notify-watcher] Regra acionada (${appName}): ${summary}`);
-  notifyServer({ app: appName, text: summary });
+  dispatchNotification(rule, summary).catch(error => {
+    console.error('[notify-watcher] Falha ao despachar notificação:', error);
+  });
+}
+
+async function dispatchNotification(rule, summary) {
+  const payload = {
+    app: rule.appName || 'WebApp',
+    text: summary,
+    rule: {
+      id: rule.id,
+      name: rule.name,
+      condition: rule.condition,
+      selector: rule.displaySelector,
+      url_contains: rule.url_contains
+    }
+  };
+
+  if (document.visibilityState === 'visible' && chrome?.runtime?.sendMessage) {
+    try {
+      const response = await new Promise(resolve => {
+        try {
+          chrome.runtime.sendMessage({ type: 'capture_screenshot' }, resolve);
+        } catch (err) {
+          resolve({ error: err?.message || String(err) });
+        }
+      });
+      if (response && response.image) {
+        payload.screenshot = response.image;
+      }
+    } catch (error) {
+      console.warn('[notify-watcher] Falha ao capturar screenshot:', error);
+    }
+  }
+
+  await notifyServer(payload);
 }
 
 function sanitizeRule(rawRule) {
@@ -181,6 +442,7 @@ function prepareRule(rule, index) {
   const displaySelector = cssSelector || textPattern || '[sem seletor]';
   const fallbackCandidates = [];
   const meta = rule.metadata || {};
+  const tagName = typeof meta.tag === 'string' ? meta.tag.toLowerCase() : '';
   if (meta.id) {
     fallbackCandidates.push(`#${escapeCss(meta.id)}`);
   }
@@ -190,8 +452,29 @@ function prepareRule(rule, index) {
       .map(cls => `.${escapeCss(cls)}`)
       .join('');
     if (classSelector) {
-      const tagName = typeof meta.tag === 'string' ? meta.tag.toLowerCase() : '';
       fallbackCandidates.push(tagName ? `${tagName}${classSelector}` : classSelector);
+    }
+  }
+  if (meta.attributes && typeof meta.attributes === 'object') {
+    const attributeEntries = Object.entries(meta.attributes)
+      .filter(([attrName, attrValue]) => typeof attrName === 'string' && typeof attrValue === 'string' && attrValue.length)
+      .slice(0, 6);
+    for (const [attrName, attrValue] of attributeEntries) {
+      const lowerAttr = attrName.toLowerCase();
+      if (lowerAttr === 'id' || lowerAttr === 'class' || lowerAttr === 'value') {
+        continue;
+      }
+      let selectorPart = '';
+      if (attrValue === 'true' || attrValue === 'false') {
+        selectorPart = `[${escapeCss(lowerAttr)}="${attrValue}"]`;
+      } else if (lowerAttr === 'disabled' || lowerAttr === 'hidden') {
+        selectorPart = `[${escapeCss(lowerAttr)}]`;
+      } else {
+        selectorPart = `[${escapeCss(lowerAttr)}="${escapeCss(attrValue)}"]`;
+      }
+      if (selectorPart) {
+        fallbackCandidates.push(tagName ? `${tagName}${selectorPart}` : selectorPart);
+      }
     }
   }
   const fallbackSelectors = Array.from(new Set(fallbackCandidates.filter(Boolean))).filter(sel => sel !== cssSelector);
@@ -236,6 +519,9 @@ function applyConfig(data, initialScan) {
   preparedRules = sanitized.map(prepareRule);
   ignoredApps = new Set(ignored);
   selectorErrorCache.clear();
+  if (initialScan || changed) {
+    refreshRuleStateCache(preparedRules);
+  }
   updateActiveRules();
 
   if (initialScan || changed) {
@@ -258,21 +544,28 @@ async function loadConfig(initialScan = false) {
   }
 }
 
-function evaluateCondition(rule, element, elementText) {
+function evaluateCondition(rule, element, elementText, state) {
   const baseline = rule.baselineText || '';
   const pattern = baseline || rule.textPattern || '';
+  const signature = state?.signature || '';
+  const signatureKey = signature ? shortHash(signature) : '';
+  const summaryParts = Array.isArray(state?.summaryParts) ? state.summaryParts.slice(0, 3) : [];
   switch (rule.condition) {
     case 'element':
-      triggerNotification(rule, {
-        summary: `Elemento detectado (${rule.displaySelector})`,
-        key: `${rule.id}|element`
-      });
+      {
+        const extras = summaryParts.length ? ` | ${summaryParts.join(' | ')}` : '';
+        const keySuffix = signatureKey ? `element|${signatureKey}` : 'element';
+        triggerNotification(rule, {
+          summary: `Elemento detectado (${rule.displaySelector})${extras}`,
+          key: `${rule.id}|${keySuffix}`
+        });
+      }
       break;
     case 'element_text':
       if (elementText && rule.textPattern && elementText.includes(rule.textPattern)) {
         triggerNotification(rule, {
           summary: `Texto encontrado: ${rule.textPattern}`,
-          key: `${rule.id}|${rule.textPattern}`
+          key: `${rule.id}|element_text|${signatureKey || elementText}`
         });
       }
       break;
@@ -280,7 +573,7 @@ function evaluateCondition(rule, element, elementText) {
       if (elementText && baseline && elementText === baseline) {
         triggerNotification(rule, {
           summary: `Texto corresponde: ${baseline}`,
-          key: `${rule.id}|equals`
+          key: `${rule.id}|equals|${elementText}`
         });
       }
       break;
@@ -296,7 +589,7 @@ function evaluateCondition(rule, element, elementText) {
       if (elementText && pattern && elementText.includes(pattern)) {
         triggerNotification(rule, {
           summary: `Texto contém "${pattern}"`,
-          key: `${rule.id}|contains`
+          key: `${rule.id}|contains|${elementText}`
         });
       }
       break;
@@ -304,7 +597,7 @@ function evaluateCondition(rule, element, elementText) {
       if (pattern && (!elementText || !elementText.includes(pattern))) {
         triggerNotification(rule, {
           summary: `Texto não contém "${pattern}"`,
-          key: `${rule.id}|notcontains`
+          key: `${rule.id}|notcontains|${signatureKey || elementText}`
         });
       }
       break;
@@ -312,7 +605,7 @@ function evaluateCondition(rule, element, elementText) {
       if (rule.lengthThreshold != null && elementText.length > rule.lengthThreshold) {
         triggerNotification(rule, {
           summary: `Texto com ${elementText.length} caracteres (limite ${rule.lengthThreshold})`,
-          key: `${rule.id}|len>${rule.lengthThreshold}`
+          key: `${rule.id}|len>${rule.lengthThreshold}|${elementText.length}`
         });
       }
       break;
@@ -320,7 +613,7 @@ function evaluateCondition(rule, element, elementText) {
       if (rule.lengthThreshold != null && elementText.length < rule.lengthThreshold) {
         triggerNotification(rule, {
           summary: `Texto com ${elementText.length} caracteres (limite ${rule.lengthThreshold})`,
-          key: `${rule.id}|len<${rule.lengthThreshold}`
+          key: `${rule.id}|len<${rule.lengthThreshold}|${elementText.length}`
         });
       }
       break;
@@ -373,10 +666,22 @@ function evaluateRuleOnElement(rule, element, { allowFallback = false } = {}) {
     }
   }
   let elementText = '';
-  if (rule.requiresText || rule.condition === 'element_text') {
+  const needsText = rule.requiresText || rule.condition === 'element';
+  if (needsText) {
     elementText = getElementText(element);
   }
-  evaluateCondition(rule, element, elementText);
+  if (allowFallback && elementText && rule.baselineText) {
+    const baselineLen = rule.baselineText.length || 1;
+    const maxAllowed = Math.max(baselineLen * 4, 250);
+    if (elementText.length > maxAllowed) {
+      return;
+    }
+  }
+  const state = buildRuleState(rule, element, elementText);
+  if (!shouldEvaluate(rule, element, state.signature)) {
+    return;
+  }
+  evaluateCondition(rule, element, elementText, state);
 }
 
 function evaluateElement(element) {
@@ -445,7 +750,7 @@ function rescanAllRules() {
             evaluateRuleOnElement(rule, element, { allowFallback: true });
           }
         });
-        if (seen.size > 25) {
+        if (seen.size > 0) {
           break;
         }
       }
@@ -468,6 +773,8 @@ function observeDom() {
         mutation.addedNodes.forEach(processNode);
       } else if (mutation.type === 'characterData' && mutation.target && mutation.target.parentElement) {
         processNode(mutation.target.parentElement);
+      } else if (mutation.type === 'attributes' && mutation.target instanceof Element) {
+        evaluateElement(mutation.target);
       }
     }
   });
@@ -477,7 +784,7 @@ function observeDom() {
       setTimeout(startObserving, 250);
       return;
     }
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true });
   };
 
   startObserving();
@@ -752,6 +1059,17 @@ function captureElement(element) {
       classes: Array.from(element.classList)
     }
   };
+  const attributeEntries = getRelevantAttributeEntries(element);
+  if (attributeEntries.length) {
+    const attributeMap = {};
+    for (const [attrName, attrValue] of attributeEntries) {
+      attributeMap[attrName] = attrValue;
+    }
+    payload.metadata.attributes = attributeMap;
+  }
+  if (textSnapshot) {
+    payload.metadata.text_fingerprint = textSnapshot.slice(0, 120);
+  }
   void sendPendingRule(payload);
 }
 

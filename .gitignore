@@ -5,3 +5,8 @@ __pycache__/
 # Environment
 venv/
 .env
+
+# Config files
+notify-watcher/config.json
+notify-watcher/pending_rule.json
+notify-watcher/ignore.json

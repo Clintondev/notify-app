@@ -4,8 +4,13 @@
   "version": "1.0",
   "description": "Captura eventos da página e os envia para um servidor local.",
   "permissions": [
-    "storage"
+    "storage",
+    "tabs",
+    "activeTab"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "host_permissions": [
     "http://localhost:3000/*"
   ],
