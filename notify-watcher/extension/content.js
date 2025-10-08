@@ -2,16 +2,38 @@
 
 const API_BASE = 'http://localhost:3000';
 const CONFIG_REFRESH_INTERVAL_MS = 15000;
+const RESCAN_INTERVAL_MS = 10000;
 const RECENT_BUFFER_LIMIT = 50;
+const TEXTUAL_CONDITIONS = new Set([
+  'element_text',
+  'text_equals',
+  'text_differs',
+  'text_contains',
+  'text_not_contains',
+  'text_length_gt',
+  'text_length_lt'
+]);
+const LENGTH_CONDITIONS = new Set(['text_length_gt', 'text_length_lt']);
 
-let rules = [];
-let applicableRules = [];
+let rawRules = [];
+let preparedRules = [];
+let activeRules = [];
 let ignoredApps = new Set();
 let rulesSignature = '';
 let lastTitle = document.title || '';
 
 const recentKeys = [];
 const recentKeySet = new Set();
+const selectorErrorCache = new Set();
+
+const selectionState = {
+  active: false,
+  overlay: null,
+  highlight: null,
+  infoBox: null,
+  lastTarget: null
+};
+let toastElement = null;
 
 function rememberNotification(key) {
   if (recentKeySet.has(key)) {
@@ -44,11 +66,11 @@ function notifyServer(payload) {
 }
 
 function sendTitleChangeNotification(newTitle) {
-  const summary = `Título alterado para: ${newTitle}`;
-  const key = `__title__|${summary}`;
   if (ignoredApps.has('Browser')) {
     return;
   }
+  const summary = `Título alterado para: ${newTitle}`;
+  const key = `__title__|${summary}`;
   if (!rememberNotification(key)) {
     return;
   }
@@ -56,41 +78,33 @@ function sendTitleChangeNotification(newTitle) {
   notifyServer({ app: 'Browser', text: summary });
 }
 
-function extractElementSummary(element) {
+function getElementText(element) {
+  if (!element) {
+    return '';
+  }
   const text = element.innerText || element.textContent || '';
-  if (!text) {
-    return '';
-  }
-  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
-  return normalizeText(lines.length ? lines[0] : text);
+  return normalizeText(text);
 }
 
-function extractTextMatchSummary(text, needle) {
-  if (!text) {
-    return '';
-  }
-  const normalized = text.replace(/\s+/g, ' ').trim();
-  if (!needle) {
-    return normalizeText(normalized);
-  }
-  const lowerNeedle = needle.toLowerCase();
-  const lowerText = normalized.toLowerCase();
-  const index = lowerText.indexOf(lowerNeedle);
-  if (index === -1) {
-    return normalizeText(normalized);
-  }
-  const start = Math.max(0, index - 40);
-  const end = Math.min(normalized.length, index + needle.length + 40);
-  return normalizeText(normalized.slice(start, end));
-}
-
-function triggerNotification(rule, matchedText) {
-  const appName = rule.name || 'WebApp';
+function triggerNotification(rule, details) {
+  const appName = rule.appName || 'WebApp';
   if (ignoredApps.has(appName)) {
     return;
   }
-  const summary = normalizeText(matchedText) || `Regra '${appName}' acionada (${rule.selector})`;
-  const key = `${appName}|${rule.type}|${rule.selector}|${summary}`;
+  let summary = '';
+  let keySuffix = '';
+  if (typeof details === 'string') {
+    summary = normalizeText(details);
+    keySuffix = summary;
+  } else if (details && typeof details === 'object') {
+    summary = normalizeText(details.summary || details.text || details.message || '');
+    keySuffix = details.key ? String(details.key) : summary;
+  }
+  if (!summary) {
+    summary = `Regra '${appName}' acionada`;
+    keySuffix = summary;
+  }
+  const key = `${rule.id}|${keySuffix}`;
   if (!rememberNotification(key)) {
     return;
   }
@@ -98,24 +112,279 @@ function triggerNotification(rule, matchedText) {
   notifyServer({ app: appName, text: summary });
 }
 
+function sanitizeRule(rawRule) {
+  if (!rawRule || typeof rawRule !== 'object') {
+    return null;
+  }
+  const name = typeof rawRule.name === 'string' ? rawRule.name.trim() : '';
+  const urlContainsRaw = typeof rawRule.url_contains === 'string' ? rawRule.url_contains : '';
+  const urlContains = urlContainsRaw.trim();
+  const pageUrl = typeof rawRule.page_url === 'string' ? rawRule.page_url : '';
+  const typeRaw = typeof rawRule.type === 'string' ? rawRule.type.toLowerCase() : 'element';
+  const type = typeRaw === 'element_text' ? 'element_text' : 'element';
+  const selectorRaw = typeof rawRule.selector === 'string' ? rawRule.selector : '';
+  const selector = selectorRaw.trim();
+  const cssSelectorRaw = typeof rawRule.css_selector === 'string' ? rawRule.css_selector : (type === 'element' ? selector : '');
+  const cssSelector = cssSelectorRaw.trim();
+  const conditionRaw = typeof rawRule.condition === 'string' ? rawRule.condition.toLowerCase() : type;
+  const condition = TEXTUAL_CONDITIONS.has(conditionRaw) || conditionRaw === 'element' ? conditionRaw : (type === 'element' ? 'element' : 'element_text');
+  const baselineText = typeof rawRule.baseline_text === 'string' ? rawRule.baseline_text : '';
+  const textSnapshot = typeof rawRule.text_snapshot === 'string' ? rawRule.text_snapshot : baselineText;
+  const lengthValue = rawRule.length_threshold != null ? Number(rawRule.length_threshold) : null;
+  const lengthThreshold = Number.isFinite(lengthValue) ? lengthValue : null;
+  const source = typeof rawRule.source === 'string' ? rawRule.source : 'manual';
+  const capturedAt = rawRule.captured_at != null ? rawRule.captured_at : null;
+  const metadata = typeof rawRule.metadata === 'object' && rawRule.metadata ? rawRule.metadata : undefined;
+
+  if (type === 'element' && !cssSelector) {
+    return null;
+  }
+  if (condition === 'element_text' && !selector && !baselineText && !textSnapshot) {
+    return null;
+  }
+  if (TEXTUAL_CONDITIONS.has(condition) && condition !== 'element_text') {
+    if (condition === 'text_length_gt' || condition === 'text_length_lt') {
+      if (!Number.isFinite(lengthThreshold)) {
+        return null;
+      }
+    } else if (!baselineText && !selector && !textSnapshot) {
+      return null;
+    }
+  }
+
+  return {
+    name: name || 'Regra',
+    url_contains: urlContains,
+    page_url: pageUrl,
+    type,
+    selector,
+    css_selector: cssSelector,
+    condition,
+    baseline_text: baselineText,
+    text_snapshot: textSnapshot,
+    length_threshold: lengthThreshold,
+    source,
+    captured_at: capturedAt,
+    metadata
+  };
+}
+
+function prepareRule(rule, index) {
+  const condition = rule.condition || rule.type || 'element';
+  const cssSelector = typeof rule.css_selector === 'string' ? rule.css_selector : '';
+  const textPattern = typeof rule.selector === 'string' ? rule.selector : '';
+  const baselineText = typeof rule.baseline_text === 'string' ? rule.baseline_text : '';
+  const textSnapshot = typeof rule.text_snapshot === 'string' && rule.text_snapshot ? rule.text_snapshot : baselineText;
+  const lengthThreshold = Number.isFinite(rule.length_threshold) ? rule.length_threshold : null;
+  const requiresText = TEXTUAL_CONDITIONS.has(condition);
+  const id = `${rule.name || 'Regra'}|${condition}|${cssSelector || textPattern || index}`;
+  const displaySelector = cssSelector || textPattern || '[sem seletor]';
+  const fallbackCandidates = [];
+  const meta = rule.metadata || {};
+  if (meta.id) {
+    fallbackCandidates.push(`#${escapeCss(meta.id)}`);
+  }
+  if (Array.isArray(meta.classes) && meta.classes.length) {
+    const classSelector = meta.classes
+      .slice(0, 3)
+      .map(cls => `.${escapeCss(cls)}`)
+      .join('');
+    if (classSelector) {
+      const tagName = typeof meta.tag === 'string' ? meta.tag.toLowerCase() : '';
+      fallbackCandidates.push(tagName ? `${tagName}${classSelector}` : classSelector);
+    }
+  }
+  const fallbackSelectors = Array.from(new Set(fallbackCandidates.filter(Boolean))).filter(sel => sel !== cssSelector);
+  return {
+    ...rule,
+    appName: rule.name || 'WebApp',
+    condition,
+    cssSelector,
+    textPattern,
+    baselineText,
+    textSnapshot,
+    lengthThreshold,
+    requiresText,
+    id,
+    displaySelector,
+    fallbackSelectors
+  };
+}
+
+function ruleMatchesCurrentUrl(rule) {
+  if (!rule.url_contains) {
+    return true;
+  }
+  return window.location.href.includes(rule.url_contains);
+}
+
+function updateActiveRules() {
+  activeRules = preparedRules.filter(ruleMatchesCurrentUrl);
+}
+
+function applyConfig(data, initialScan) {
+  const incomingRules = Array.isArray(data?.rules) ? data.rules : Array.isArray(data) ? data : [];
+  const sanitized = incomingRules.map(sanitizeRule).filter(Boolean);
+  const incomingIgnored = Array.isArray(data?.ignored_apps) ? data.ignored_apps : [];
+  const ignored = incomingIgnored.map(item => String(item).trim()).filter(Boolean);
+
+  const nextSignature = JSON.stringify({ rules: sanitized, ignored });
+  const changed = nextSignature !== rulesSignature;
+  rulesSignature = nextSignature;
+
+  rawRules = sanitized;
+  preparedRules = sanitized.map(prepareRule);
+  ignoredApps = new Set(ignored);
+  selectorErrorCache.clear();
+  updateActiveRules();
+
+  if (initialScan || changed) {
+    console.log(`[notify-watcher] Config carregada: ${preparedRules.length} regras (${activeRules.length} aplicáveis nesta página)`);
+    scanDocument();
+    rescanAllRules();
+  }
+}
+
+async function loadConfig(initialScan = false) {
+  try {
+    const response = await fetch(`${API_BASE}/config`, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`Status ${response.status}`);
+    }
+    const data = await response.json();
+    applyConfig(data, initialScan);
+  } catch (error) {
+    console.error('[notify-watcher] Erro ao carregar config:', error);
+  }
+}
+
+function evaluateCondition(rule, element, elementText) {
+  const baseline = rule.baselineText || '';
+  const pattern = baseline || rule.textPattern || '';
+  switch (rule.condition) {
+    case 'element':
+      triggerNotification(rule, {
+        summary: `Elemento detectado (${rule.displaySelector})`,
+        key: `${rule.id}|element`
+      });
+      break;
+    case 'element_text':
+      if (elementText && rule.textPattern && elementText.includes(rule.textPattern)) {
+        triggerNotification(rule, {
+          summary: `Texto encontrado: ${rule.textPattern}`,
+          key: `${rule.id}|${rule.textPattern}`
+        });
+      }
+      break;
+    case 'text_equals':
+      if (elementText && baseline && elementText === baseline) {
+        triggerNotification(rule, {
+          summary: `Texto corresponde: ${baseline}`,
+          key: `${rule.id}|equals`
+        });
+      }
+      break;
+    case 'text_differs':
+      if (elementText && baseline && elementText !== baseline) {
+        triggerNotification(rule, {
+          summary: `Texto alterado: ${elementText}`,
+          key: `${rule.id}|${elementText}`
+        });
+      }
+      break;
+    case 'text_contains':
+      if (elementText && pattern && elementText.includes(pattern)) {
+        triggerNotification(rule, {
+          summary: `Texto contém "${pattern}"`,
+          key: `${rule.id}|contains`
+        });
+      }
+      break;
+    case 'text_not_contains':
+      if (pattern && (!elementText || !elementText.includes(pattern))) {
+        triggerNotification(rule, {
+          summary: `Texto não contém "${pattern}"`,
+          key: `${rule.id}|notcontains`
+        });
+      }
+      break;
+    case 'text_length_gt':
+      if (rule.lengthThreshold != null && elementText.length > rule.lengthThreshold) {
+        triggerNotification(rule, {
+          summary: `Texto com ${elementText.length} caracteres (limite ${rule.lengthThreshold})`,
+          key: `${rule.id}|len>${rule.lengthThreshold}`
+        });
+      }
+      break;
+    case 'text_length_lt':
+      if (rule.lengthThreshold != null && elementText.length < rule.lengthThreshold) {
+        triggerNotification(rule, {
+          summary: `Texto com ${elementText.length} caracteres (limite ${rule.lengthThreshold})`,
+          key: `${rule.id}|len<${rule.lengthThreshold}`
+        });
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+function matchesPrimarySelector(rule, element) {
+  if (!rule.cssSelector) {
+    return true;
+  }
+  try {
+    return Boolean(element.matches && element.matches(rule.cssSelector));
+  } catch (error) {
+    if (!selectorErrorCache.has(rule.cssSelector)) {
+      selectorErrorCache.add(rule.cssSelector);
+      console.error('[notify-watcher] Seletor inválido:', rule.cssSelector, error);
+    }
+    return false;
+  }
+}
+
+function matchesFallbackSelector(rule, element) {
+  if (!rule.fallbackSelectors || !rule.fallbackSelectors.length) {
+    return false;
+  }
+  for (const selector of rule.fallbackSelectors) {
+    try {
+      if (element.matches && element.matches(selector)) {
+        return true;
+      }
+    } catch (error) {
+      if (!selectorErrorCache.has(selector)) {
+        selectorErrorCache.add(selector);
+        console.error('[notify-watcher] Seletor inválido:', selector, error);
+      }
+    }
+  }
+  return false;
+}
+
+function evaluateRuleOnElement(rule, element, { allowFallback = false } = {}) {
+  if (!(element instanceof Element)) {
+    return;
+  }
+  if (!matchesPrimarySelector(rule, element)) {
+    if (!(allowFallback && matchesFallbackSelector(rule, element))) {
+      return;
+    }
+  }
+  let elementText = '';
+  if (rule.requiresText || rule.condition === 'element_text') {
+    elementText = getElementText(element);
+  }
+  evaluateCondition(rule, element, elementText);
+}
+
 function evaluateElement(element) {
   if (!(element instanceof Element)) {
     return;
   }
-  for (const rule of applicableRules) {
-    if (!rule.selector) {
-      continue;
-    }
-    if (rule.type === 'element') {
-      if (element.matches(rule.selector)) {
-        triggerNotification(rule, extractElementSummary(element));
-      }
-    } else if (rule.type === 'element_text') {
-      const textContent = element.innerText || element.textContent || '';
-      if (textContent && textContent.includes(rule.selector)) {
-        triggerNotification(rule, extractTextMatchSummary(textContent, rule.selector));
-      }
-    }
+  for (const rule of activeRules) {
+    evaluateRuleOnElement(rule, element);
   }
 }
 
@@ -137,70 +406,50 @@ function scanDocument() {
   processNode(document.body);
 }
 
-function ruleMatchesCurrentUrl(rule) {
-  if (!rule.url_contains) {
-    return true;
+function rescanAllRules() {
+  if (!document.body || !activeRules.length) {
+    return;
   }
-  return window.location.href.includes(rule.url_contains);
-}
-
-function updateApplicableRules() {
-  applicableRules = rules.filter(ruleMatchesCurrentUrl);
-}
-
-function sanitizeRule(rawRule) {
-  if (!rawRule || typeof rawRule !== 'object') {
-    return null;
-  }
-  const name = typeof rawRule.name === 'string' ? rawRule.name : '';
-  const cleanName = name.trim();
-  const urlContains = typeof rawRule.url_contains === 'string' ? rawRule.url_contains : '';
-  const cleanUrlContains = urlContains.trim();
-  const selector = typeof rawRule.selector === 'string' ? rawRule.selector : '';
-  const cleanSelector = selector.trim();
-  const typeValue = typeof rawRule.type === 'string' ? rawRule.type : 'element';
-  const type = typeValue === 'element_text' ? 'element_text' : 'element';
-  if (!cleanSelector) {
-    return null;
-  }
-  return {
-    name: cleanName || 'Regra',
-    url_contains: cleanUrlContains,
-    selector: cleanSelector,
-    type
-  };
-}
-
-function applyConfig(data, initialScan) {
-  const incomingRules = Array.isArray(data?.rules) ? data.rules : Array.isArray(data) ? data : [];
-  const sanitized = incomingRules.map(sanitizeRule).filter(Boolean);
-  const incomingIgnored = Array.isArray(data?.ignored_apps) ? data.ignored_apps : [];
-  const ignored = incomingIgnored.map(item => String(item).trim()).filter(Boolean);
-
-  const nextSignature = JSON.stringify({ rules: sanitized, ignored });
-  const changed = nextSignature !== rulesSignature;
-  rulesSignature = nextSignature;
-
-  rules = sanitized;
-  ignoredApps = new Set(ignored);
-  updateApplicableRules();
-
-  if (initialScan || changed) {
-    console.log(`[notify-watcher] Regras carregadas: ${rules.length}, ignorados: ${ignoredApps.size}`);
-    scanDocument();
-  }
-}
-
-async function loadConfig(initialScan = false) {
-  try {
-    const response = await fetch(`${API_BASE}/config`, { cache: 'no-store' });
-    if (!response.ok) {
-      throw new Error(`Status ${response.status}`);
+  for (const rule of activeRules) {
+    let matchedPrimary = false;
+    if (rule.cssSelector) {
+      try {
+        const primaryElements = document.querySelectorAll(rule.cssSelector);
+        if (primaryElements.length) {
+          matchedPrimary = true;
+          primaryElements.forEach(element => evaluateRuleOnElement(rule, element));
+        }
+      } catch (error) {
+        if (!selectorErrorCache.has(rule.cssSelector)) {
+          selectorErrorCache.add(rule.cssSelector);
+          console.error('[notify-watcher] Seletor inválido durante varredura:', rule.cssSelector, error);
+        }
+      }
     }
-    const data = await response.json();
-    applyConfig(data, initialScan);
-  } catch (error) {
-    console.error('[notify-watcher] Erro ao carregar config:', error);
+    if (!matchedPrimary && rule.fallbackSelectors && rule.fallbackSelectors.length) {
+      const seen = new Set();
+      for (const selector of rule.fallbackSelectors) {
+        let elements;
+        try {
+          elements = document.querySelectorAll(selector);
+        } catch (error) {
+          if (!selectorErrorCache.has(selector)) {
+            selectorErrorCache.add(selector);
+            console.error('[notify-watcher] Seletor inválido durante varredura:', selector, error);
+          }
+          continue;
+        }
+        elements.forEach(element => {
+          if (!seen.has(element)) {
+            seen.add(element);
+            evaluateRuleOnElement(rule, element, { allowFallback: true });
+          }
+        });
+        if (seen.size > 25) {
+          break;
+        }
+      }
+    }
   }
 }
 
@@ -239,7 +488,7 @@ function observeTitlePoller() {
 }
 
 function handleUrlChange() {
-  updateApplicableRules();
+  updateActiveRules();
   scanDocument();
 }
 
@@ -259,6 +508,266 @@ function instrumentHistory() {
   wrap('replaceState');
 }
 
+function showTemporaryMessage(message, type = 'info') {
+  if (!document.body) {
+    console.log(`[notify-watcher] ${message}`);
+    return;
+  }
+  if (toastElement) {
+    toastElement.remove();
+    toastElement = null;
+  }
+  const toast = document.createElement('div');
+  toast.textContent = message;
+  toast.style.position = 'fixed';
+  toast.style.top = '16px';
+  toast.style.right = '16px';
+  toast.style.zIndex = '2147483647';
+  toast.style.padding = '12px 16px';
+  toast.style.background = type === 'error' ? '#B00020' : '#323232';
+  toast.style.color = '#fff';
+  toast.style.fontSize = '13px';
+  toast.style.lineHeight = '18px';
+  toast.style.borderRadius = '6px';
+  toast.style.boxShadow = '0 4px 12px rgba(0,0,0,0.25)';
+  toast.style.pointerEvents = 'none';
+  document.body.appendChild(toast);
+  toastElement = toast;
+  setTimeout(() => {
+    if (toastElement === toast) {
+      toast.remove();
+      toastElement = null;
+    }
+  }, 4000);
+}
+
+function escapeCss(value) {
+  if (typeof CSS !== 'undefined' && CSS.escape) {
+    return CSS.escape(value);
+  }
+  return String(value).replace(/([ !"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
+}
+
+function buildCssSelector(element) {
+  if (!(element instanceof Element)) {
+    return '';
+  }
+  if (element.id) {
+    return `#${escapeCss(element.id)}`;
+  }
+  const parts = [];
+  let current = element;
+  while (current && current.nodeType === 1 && current !== document.documentElement) {
+    let part = current.nodeName.toLowerCase();
+    if (current.classList.length) {
+      const classNames = Array.from(current.classList).slice(0, 3).map(escapeCss);
+      if (classNames.length) {
+        part += '.' + classNames.join('.');
+      }
+    }
+    const parent = current.parentElement;
+    if (parent) {
+      const siblings = Array.from(parent.children).filter(child => child.nodeName === current.nodeName);
+      if (siblings.length > 1) {
+        const index = siblings.indexOf(current) + 1;
+        part += `:nth-of-type(${index})`;
+      }
+    }
+    parts.unshift(part);
+    if (current.id) {
+      parts.unshift(`#${escapeCss(current.id)}`);
+      break;
+    }
+    current = parent;
+  }
+  return parts.join(' > ');
+}
+
+async function sendPendingRule(rule) {
+  try {
+    const response = await fetch(`${API_BASE}/pending_rule`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rule)
+    });
+    if (!response.ok) {
+      throw new Error(`Status ${response.status}`);
+    }
+    showTemporaryMessage('Elemento capturado! Revise no app desktop.');
+  } catch (error) {
+    console.error('[notify-watcher] Falha ao enviar regra pendente:', error);
+    showTemporaryMessage('Não foi possível enviar a regra capturada.', 'error');
+  }
+}
+
+function createSelectionOverlay() {
+  if (selectionState.overlay) {
+    return;
+  }
+  const overlay = document.createElement('div');
+  overlay.style.position = 'fixed';
+  overlay.style.left = '0';
+  overlay.style.top = '0';
+  overlay.style.right = '0';
+  overlay.style.bottom = '0';
+  overlay.style.zIndex = '2147483646';
+  overlay.style.pointerEvents = 'none';
+
+  const highlight = document.createElement('div');
+  highlight.style.position = 'absolute';
+  highlight.style.pointerEvents = 'none';
+  highlight.style.border = '2px solid #00BCD4';
+  highlight.style.background = 'rgba(0, 188, 212, 0.15)';
+  highlight.style.borderRadius = '4px';
+
+  const infoBox = document.createElement('div');
+  infoBox.textContent = 'Clique no elemento para monitorar. ESC para cancelar.';
+  infoBox.style.position = 'fixed';
+  infoBox.style.left = '50%';
+  infoBox.style.top = '16px';
+  infoBox.style.transform = 'translateX(-50%)';
+  infoBox.style.padding = '10px 16px';
+  infoBox.style.background = '#00BCD4';
+  infoBox.style.color = '#000';
+  infoBox.style.fontSize = '13px';
+  infoBox.style.fontWeight = '500';
+  infoBox.style.borderRadius = '999px';
+  infoBox.style.pointerEvents = 'none';
+  infoBox.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
+
+  overlay.appendChild(highlight);
+  overlay.appendChild(infoBox);
+  document.documentElement.appendChild(overlay);
+
+  selectionState.overlay = overlay;
+  selectionState.highlight = highlight;
+  selectionState.infoBox = infoBox;
+}
+
+function removeSelectionOverlay() {
+  if (selectionState.overlay && selectionState.overlay.parentElement) {
+    selectionState.overlay.parentElement.removeChild(selectionState.overlay);
+  }
+  selectionState.overlay = null;
+  selectionState.highlight = null;
+  selectionState.infoBox = null;
+  selectionState.lastTarget = null;
+}
+
+function updateHighlight(target) {
+  if (!selectionState.highlight || !(target instanceof Element)) {
+    return;
+  }
+  const rect = target.getBoundingClientRect();
+  selectionState.highlight.style.left = `${rect.left + window.scrollX}px`;
+  selectionState.highlight.style.top = `${rect.top + window.scrollY}px`;
+  selectionState.highlight.style.width = `${Math.max(rect.width, 2)}px`;
+  selectionState.highlight.style.height = `${Math.max(rect.height, 2)}px`;
+  if (selectionState.infoBox) {
+    selectionState.infoBox.textContent = `Tag: ${target.tagName.toLowerCase()} | id: ${target.id || '-'} | classes: ${Array.from(target.classList).join(' ') || '-'}`;
+  }
+}
+
+function handleSelectionMouseMove(event) {
+  if (!selectionState.active) {
+    return;
+  }
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  selectionState.lastTarget = target;
+  updateHighlight(target);
+}
+
+function handleSelectionClick(event) {
+  if (!selectionState.active) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  const target = selectionState.lastTarget instanceof Element ? selectionState.lastTarget : (event.target instanceof Element ? event.target : null);
+  if (target) {
+    captureElement(target);
+  } else {
+    showTemporaryMessage('Não foi possível identificar o elemento selecionado.', 'error');
+  }
+  stopSelectionMode();
+}
+
+function handleSelectionKeydown(event) {
+  if (!selectionState.active) {
+    return;
+  }
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    stopSelectionMode();
+  }
+}
+
+function startSelectionMode() {
+  if (selectionState.active) {
+    return;
+  }
+  selectionState.active = true;
+  createSelectionOverlay();
+  document.addEventListener('mousemove', handleSelectionMouseMove, true);
+  document.addEventListener('click', handleSelectionClick, true);
+  document.addEventListener('keydown', handleSelectionKeydown, true);
+  showTemporaryMessage('Selecione um elemento na página…');
+}
+
+function stopSelectionMode() {
+  if (!selectionState.active) {
+    return;
+  }
+  selectionState.active = false;
+  document.removeEventListener('mousemove', handleSelectionMouseMove, true);
+  document.removeEventListener('click', handleSelectionClick, true);
+  document.removeEventListener('keydown', handleSelectionKeydown, true);
+  removeSelectionOverlay();
+}
+
+function captureElement(element) {
+  const cssSelector = buildCssSelector(element);
+  const textSnapshot = getElementText(element);
+  const hasText = Boolean(textSnapshot);
+  const suggestedCondition = hasText ? 'text_differs' : 'element';
+  const payload = {
+    name: hasText ? textSnapshot.slice(0, 60) : `${element.tagName.toLowerCase()} (${cssSelector})`,
+    page_url: window.location.href,
+    url_contains: window.location.hostname,
+    type: 'element',
+    selector: cssSelector,
+    css_selector: cssSelector,
+    condition: suggestedCondition,
+    text_snapshot: textSnapshot,
+    baseline_text: textSnapshot,
+    length_threshold: hasText ? textSnapshot.length : undefined,
+    source: 'extension',
+    captured_at: Date.now() / 1000,
+    metadata: {
+      tag: element.tagName.toLowerCase(),
+      id: element.id || null,
+      classes: Array.from(element.classList)
+    }
+  };
+  void sendPendingRule(payload);
+}
+
+function handleGlobalKeydown(event) {
+  if (event.altKey && event.shiftKey && event.key.toLowerCase() === 'n') {
+    event.preventDefault();
+    if (selectionState.active) {
+      stopSelectionMode();
+    } else {
+      startSelectionMode();
+    }
+  } else if (event.key === 'Escape' && selectionState.active) {
+    stopSelectionMode();
+  }
+}
+
 async function initialize() {
   console.log('[notify-watcher] Script injetado.');
   await loadConfig(true);
@@ -266,8 +775,10 @@ async function initialize() {
   observeTitlePoller();
   window.addEventListener('hashchange', handleUrlChange);
   window.addEventListener('popstate', handleUrlChange);
+  document.addEventListener('keydown', handleGlobalKeydown, false);
   instrumentHistory();
   setInterval(() => loadConfig(false), CONFIG_REFRESH_INTERVAL_MS);
+  setInterval(rescanAllRules, RESCAN_INTERVAL_MS);
 }
 
 if (document.readyState === 'loading') {
